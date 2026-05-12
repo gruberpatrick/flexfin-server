@@ -1,0 +1,5 @@
+*tidal_creds.json
+*.cpython*
+*.DS_Store
+*__pycache__*
+data/
