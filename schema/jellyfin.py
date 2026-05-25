@@ -151,7 +151,7 @@ class UserData(JellyModel):
 
 
 class MediaStream(JellyModel):
-    codec: str = "mp3"
+    codec: str = "flac"
     type: str = "Audio"
     index: int = 0
     is_default: bool = True
@@ -175,18 +175,18 @@ class MediaSource(JellyModel):
     protocol: str = "Http"
     path: str = ""
     type: str = "Default"
-    container: str = "mp3"
+    container: str = "ts"
     size: int | None = None
     is_remote: bool = False
     etag: str = ""
-    run_time_ticks: int = 0 
+    run_time_ticks: int = 0
     read_at_native_framerate: bool = False
     ignore_dts: bool = False
     ignore_index: bool = False
     gen_pts_input: bool = False
     supports_transcoding: bool = True
-    supports_direct_stream: bool = True
-    supports_direct_play: bool = True
+    supports_direct_stream: bool = False
+    supports_direct_play: bool = False
     is_infinite_stream: bool = False
     requires_opening: bool = False
     requires_closing: bool = False
@@ -199,6 +199,15 @@ class MediaSource(JellyModel):
     transcoding_url: str | None = None
     transcoding_sub_protocol: str = "hls"
     transcoding_container: str = "ts"
+
+    @classmethod
+    def hls_for(cls, item_id: str, run_time_ticks: int = 0) -> "MediaSource":
+        """Build a MediaSource that points clients at our HLS endpoint."""
+        return cls(
+            id=item_id,
+            run_time_ticks=run_time_ticks,
+            transcoding_url=f"/Audio/{item_id}/master.m3u8?MediaSourceId={item_id}",
+        )
 
 
 class MinimalArtistElements(JellyModel):
@@ -272,7 +281,7 @@ class Track(JellyModel):
     genres: list[str] = []
     genre_items: list[str] = []
     date_created: str = "2024-01-01T00:00:00.0000000Z"
-    container: str = "mp3"
+    container: str = "ts"
     type: str = "Audio"
     media_type: str = "Audio"
     is_folder: bool = False
@@ -303,7 +312,7 @@ class Track(JellyModel):
             artist_items=artist_mapping,
             production_year=production_year,
             run_time_ticks=run_time_ticks,
-            media_sources=[MediaSource(id=id, run_time_ticks=run_time_ticks)],
+            media_sources=[MediaSource.hls_for(id, run_time_ticks=run_time_ticks)],
             image_tags={"Primary": cover_id} if cover_id else {},
             index_number=index_number,
             parent_index_number=parent_index_number,

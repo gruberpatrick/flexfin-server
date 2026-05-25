@@ -196,6 +196,25 @@ def get_track_stream(id):
     return TidalClient().stream_track(id)
 
 
+def get_single_item_response(item_id: str, user_id: str) -> Response | None:
+    """Fetch a single tidal item by prefixed id and return it as a Jellyfin item.
+    Returns None if the prefix isn't recognized or the Tidal lookup fails."""
+    client = TidalClient()
+    try:
+        if (tid := _strip_prefix(item_id, "tidal_track_")) is not None:
+            return _return_json(_to_track_item(client.raw_track(tid), user_id))
+        if (tid := _strip_prefix(item_id, "tidal_album_")) is not None:
+            return _return_json(_to_album_item(client.raw_album(tid), user_id))
+        if (tid := _strip_prefix(item_id, "tidal_artist_")) is not None:
+            return _return_json(_to_artist_item(client.raw_artist(tid), user_id))
+        if (tid := _strip_prefix(item_id, "tidal_playlist_")) is not None:
+            return _return_json(_to_playlist_item(client.raw_playlist(tid), user_id))
+    except Exception:
+        log.exception("get_single_item failed for %s", item_id)
+        return None
+    return None
+
+
 def playlist_tracks_response(playlist_id: str, user_id: str, start_index: int = 0) -> Response:
     """Return the Audio items for a Tidal playlist, in the Jellyfin Items shape."""
     tidal_id = _strip_prefix(playlist_id, "tidal_playlist_") or playlist_id

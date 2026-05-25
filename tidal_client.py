@@ -147,17 +147,29 @@ class TidalClient:
         codec_name = str(codec_enum).split(".")[-1].upper()
         codec = CODEC_MAP.get(codec_name, "mp4a.40.2")
 
-        hls = None
+        seg_urls = manifest.get_urls()
         try:
             hls = manifest.get_hls()
         except Exception:
-            pass
+            # BTS streams are single-file (AAC/MP4) — tidalapi's get_hls() only
+            # handles MPD. Wrap the lone URL in a 1-segment HLS manifest so
+            # clients can always use the HLS playback path.
+            duration = max(int(track.duration or 1), 1)
+            hls = (
+                "#EXTM3U\n"
+                "#EXT-X-VERSION:3\n"
+                f"#EXT-X-TARGETDURATION:{duration + 1}\n"
+                "#EXT-X-MEDIA-SEQUENCE:0\n"
+                "#EXT-X-PLAYLIST-TYPE:VOD\n"
+                f"#EXTINF:{float(track.duration or duration):.3f},\n"
+                f"{seg_urls[0]}\n"
+                "#EXT-X-ENDLIST\n"
+            )
 
         return {
             "mime": manifest.manifest_mime_type,
             "codec": codec,
-            "seg_urls": manifest.get_urls(),
-            # "init_url": manifest.get_init_url() if "dash" in manifest.manifest_mime_type.lower() else None,
+            "seg_urls": seg_urls,
             "duration": track.duration,
             "hls": hls,
         }
@@ -301,8 +313,50 @@ class TidalClient:
         track = self._get_session().track(track_id)
         return self._stream_track(track)
 
+    def raw_track(self, track_id):
+        return self._get_session().track(track_id)
+
+    def raw_album(self, album_id):
+        return self._get_session().album(album_id)
+
+    def raw_artist(self, artist_id):
+        return self._get_session().artist(artist_id)
+
+    def raw_playlist(self, playlist_id):
+        return self._get_session().playlist(playlist_id)
+
+    # Higher rank = better quality. Tidal lists the same release once per
+    # quality tier (and again for Dolby Atmos), so we collapse them.
+    _QUALITY_RANK = {
+        "HI_RES_LOSSLESS": 4,
+        "LOSSLESS": 3,
+        "HIGH": 2,
+        "LOW": 1,
+    }
+
     def albums_for_artist(self, artist_id, limit=None):
-        return self._get_session().artist(artist_id).get_albums(limit=limit)
+        # Tidal splits LPs and EPs/singles across two endpoints; modern artists
+        # often release only singles, so we merge both.
+        artist = self._get_session().artist(artist_id)
+        albums = list(artist.get_albums(limit=limit) or [])
+        singles = list(artist.get_ep_singles(limit=limit) or [])
+
+        best: dict = {}
+        for a in albums + singles:
+            primary = a.artist.name if a.artist is not None else ""
+            title = (a.name or "").strip().lower()
+            date = a.release_date.toordinal() if a.release_date else 0
+            key = (title, primary, date)
+            rank = self._QUALITY_RANK.get(a.audio_quality or "", 0)
+            if key not in best or rank > self._QUALITY_RANK.get(best[key].audio_quality or "", 0):
+                best[key] = a
+
+        merged = list(best.values())
+        merged.sort(
+            key=lambda a: a.release_date.toordinal() if a.release_date else 0,
+            reverse=True,
+        )
+        return merged[:limit] if limit else merged
 
     def top_tracks_for_artist(self, artist_id, limit=50):
         return self._get_session().artist(artist_id).get_top_tracks(limit=limit)

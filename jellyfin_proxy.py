@@ -7,7 +7,8 @@ Login: user=test, password=test (password is ignored)
 """
 
 import uuid
-from flask import Flask, jsonify, request, Response, abort, redirect
+import requests
+from flask import Flask, jsonify, request, Response, abort, redirect, stream_with_context
 import logging
 
 from schema.jellyfin import (
@@ -15,7 +16,10 @@ from schema.jellyfin import (
 )
 
 import db
-from translate.tidal_jellyfin_translator import process_items, get_track_stream, playlist_tracks_response, SERVER_ID
+from translate.tidal_jellyfin_translator import (
+    process_items, get_track_stream, playlist_tracks_response,
+    get_single_item_response, SERVER_ID,
+)
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s",)
@@ -160,8 +164,26 @@ def items(user_id=None):
 
 @app.route("/Users/<user_id>/Items/<item_id>")
 @app.route("/Items/<item_id>")
+@app.route("/users/<user_id>/items/<item_id>")
+@app.route("/items/<item_id>")
 def get_item(item_id, user_id=None):
+    uid = user_id or request.args.get("UserId") or db.DEFAULT_USER_ID
+    response = get_single_item_response(item_id, uid)
+    if response is not None:
+        return response
     return process_items(request, user_id=user_id)
+
+
+@app.route("/Items/Filters")
+@app.route("/items/filters")
+def items_filters():
+    """Available filter values. We don't track tags/ratings/years, so return empty."""
+    return jsonify({
+        "Genres": [],
+        "Tags": [],
+        "OfficialRatings": [],
+        "Years": [],
+    })
 
 
 @app.route("/Albums/<album_id>/Similar")
@@ -184,7 +206,7 @@ def album_artists():
 @app.route("/Items/<item_id>/PlaybackInfo", methods=["GET", "POST"])
 def playback_info(item_id):
     return jsonify({
-        "MediaSources": [MediaSource(id=item_id).model_dump(by_alias=True)],
+        "MediaSources": [MediaSource.hls_for(item_id).model_dump(by_alias=True)],
         "PlaySessionId": str(uuid.uuid4()),
     })
 
@@ -194,21 +216,36 @@ def playback_info(item_id):
 @app.route("/Audio/<item_id>/stream.m3u8")
 @app.route("/Audio/<item_id>/stream")
 @app.route("/Audio/<item_id>/universal")
-@app.route("/Items/<item_id>/File")
-@app.route("/Items/<item_id>/Download")
 def audio_hls(item_id):
-    """Return HLS playlist. Redirect to the actual source."""
-
+    """HLS playlist. Segment URLs point straight at Tidal's CDN."""
     if not item_id.startswith("tidal_track_"):
         return Response(status=404)
-
     track_id = item_id[len("tidal_track_"):]
-
     stream = get_track_stream(track_id)
-    if stream.get("hls") is not None:
-        return Response(stream.get("hls"), mimetype="application/vnd.apple.mpegurl")
+    return Response(stream["hls"], mimetype="application/vnd.apple.mpegurl")
 
-    return redirect(stream.get("seg_urls")[0])
+
+@app.route("/Items/<item_id>/File")
+@app.route("/Items/<item_id>/Download")
+def audio_download(item_id):
+    """Raw audio bytes. Single-file streams 302 to Tidal; multi-segment
+    streams (DASH fMP4) are byte-concatenated through us."""
+    if not item_id.startswith("tidal_track_"):
+        return Response(status=404)
+    track_id = item_id[len("tidal_track_"):]
+    stream = get_track_stream(track_id)
+    seg_urls = stream["seg_urls"]
+    if len(seg_urls) == 1:
+        return redirect(seg_urls[0])
+
+    def gen():
+        for url in seg_urls:
+            with requests.get(url, stream=True, timeout=30) as r:
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        yield chunk
+
+    return Response(stream_with_context(gen()), mimetype="audio/mp4")
 
 
 # ============================================================
