@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(/opt/homebrew/Caskroom/miniconda/base/bin/python -c \"import jellyfin_proxy; print\\('ok'\\)\")"
-    ]
-  }
-}
