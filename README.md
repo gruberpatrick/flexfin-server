@@ -1,22 +1,23 @@
-# jellyfin_proxy
+# flexfin-server
 
+The server half of Flexfin.
 A Flask app that speaks the Jellyfin API and serves Tidal as the library.
 
 Point any Jellyfin client at it and you can browse, search and play Tidal without the client knowing Tidal exists.
-Tested with Finamp and Feishin.
+Tested with Finamp and Feishin, and the intended companion is the Flexfin client.
 
-Login is delegated to a real Jellyfin instance, so the proxy holds no user accounts and no passwords of its own.
+Login is delegated to a real Jellyfin instance, so the server holds no user accounts and no passwords of its own.
 
 ## How it works
 
-The proxy translates Jellyfin API calls into [tidalapi](https://github.com/tamland/python-tidal) calls and renders the results as Jellyfin JSON.
+Flexfin translates Jellyfin API calls into [tidalapi](https://github.com/tamland/python-tidal) calls and renders the results as Jellyfin JSON.
 Item ids are Tidal ids with a type prefix: `tidal_track_`, `tidal_album_`, `tidal_artist_`, `tidal_playlist_`.
 
-Audio never passes through the proxy.
+Audio never passes through the server.
 Playback returns an HLS playlist whose segments are Tidal CDN URLs, and downloads return a 302 to a single Tidal CDN URL, so the client fetches bytes directly from Tidal.
-The proxy only ever carries JSON and playlists.
+It only ever carries JSON and playlists.
 
-A sqlite database caches every item the proxy surfaces, which feeds the image endpoint and per-track user data, and stores favourites, play counts and sessions.
+A sqlite database caches every item the server surfaces, which feeds the image endpoint and per-track user data, and stores favourites, play counts and sessions.
 
 ## Requirements
 
@@ -63,8 +64,8 @@ export JELLYFIN_URL=http://your-jellyfin:8096
 .venv/bin/gunicorn -b 0.0.0.0:8096 jellyfin_proxy:app     # or under gunicorn
 ```
 
-Now point your client at the proxy and log in with your **Jellyfin** username and password.
-The proxy forwards them to `JELLYFIN_URL` and, if Jellyfin accepts, issues its own token.
+Now point your client at Flexfin and log in with your **Jellyfin** username and password.
+It forwards them to `JELLYFIN_URL` and, if Jellyfin accepts, issues its own token.
 
 ## Configuration
 
@@ -137,8 +138,8 @@ Serving lossless downloads means assembling the segments into a file, which is w
 **Image endpoints are unauthenticated.**
 This matches Jellyfin, which marks them `[AllowAnonymous]` because browsers cannot attach headers to `<img>` tags, and clients such as Feishin rely on it.
 Jellyfin gets away with it because its item ids are unguessable GUIDs.
-Here the ids are Tidal's own sequential ids, so anyone who can reach the proxy can probe them.
-Nothing private is exposed, only public Tidal artwork, but a prober can learn which items have been browsed through this proxy.
+Here the ids are Tidal's own sequential ids, so anyone who can reach the server can probe them.
+Nothing private is exposed, only public Tidal artwork, but a prober can learn which items have been browsed through this server.
 
 **`MediaSources` in item listings do not carry a token.**
 `PlaybackInfo` does, which is the path Jellyfin documents, but a client that plays straight from a listing URL will get a 401.
