@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import os
@@ -5,6 +6,7 @@ import pathlib
 import requests
 import subprocess
 import shutil
+import threading
 
 import tidalapi
 from mutagen.flac import FLAC
@@ -16,19 +18,44 @@ logger = logging.getLogger(__name__)
 MEDIA_PATH = "./"
 CREDS_FILE = pathlib.Path("tidal_creds.json")
 
+# Quality requested when a client wants the track as one downloadable file.
+# HI_RES_LOSSLESS is delivered as multi-segment DASH, which has no single URL to
+# redirect to, so downloads deliberately ask for a tier Tidal serves as one
+# file. Playback is unaffected and stays on the hi-res HLS path.
+DOWNLOAD_QUALITY = os.environ.get("TIDAL_DOWNLOAD_QUALITY", "LOSSLESS")
+
 _session: tidalapi.Session | None = None
+# The access token currently written to CREDS_FILE, so we can tell when the
+# in-memory one has moved on and needs saving.
 _last_saved_token: str | None = None
+# tidalapi reads the requested quality off the shared session on every call, so
+# a temporary override has to exclude other threads for its duration.
+_quality_lock = threading.Lock()
+
+
+class TidalAuthError(RuntimeError):
+    """The stored credentials are unusable and a fresh OAuth login is needed."""
 
 
 def _save_creds(session: tidalapi.Session) -> None:
     global _last_saved_token
+    expiry = session.expiry_time
     CREDS_FILE.write_text(json.dumps({
         "token_type": session.token_type,
         "access_token": session.access_token,
         "refresh_token": session.refresh_token,
-        "expiry_time": session.expiry_time.isoformat(),
+        "expiry_time": expiry.isoformat() if expiry is not None else None,
     }))
     _last_saved_token = session.access_token
+    logger.info("saved refreshed Tidal token to %s (expires %s)", CREDS_FILE, expiry)
+
+
+def _load_creds() -> dict:
+    creds = json.loads(CREDS_FILE.read_text())
+    # We serialise expiry_time with isoformat(); tidalapi wants a datetime back.
+    expiry = creds.get("expiry_time")
+    creds["expiry_time"] = datetime.datetime.fromisoformat(expiry) if expiry else None
+    return creds
 
 
 def _persist_if_refreshed(session: tidalapi.Session) -> None:
@@ -51,8 +78,24 @@ class TidalClient:
         session.audio_quality = tidalapi.Quality.hi_res_lossless
 
         if CREDS_FILE.exists():
-            session.load_oauth_session(**json.loads(CREDS_FILE.read_text()))
-            _last_saved_token = session.access_token
+            creds = _load_creds()
+            # Record what is on disk *before* logging in. load_oauth_session()
+            # refreshes an expired access token internally, and Tidal's access
+            # tokens only live four hours -- reading the token back off the
+            # session afterwards would mark that brand new token as already
+            # saved, so it would never reach disk and every restart would begin
+            # from the same dead token.
+            _last_saved_token = creds.get("access_token")
+            if not session.load_oauth_session(**creds):
+                # Don't cache a session that can't talk to Tidal: leaving
+                # _session unset means the next request retries rather than
+                # failing for the lifetime of the process.
+                raise TidalAuthError(
+                    f"Tidal rejected the credentials in {CREDS_FILE.resolve()}. "
+                    "The refresh token has expired - delete the file and run an "
+                    "interactive login to re-authorise."
+                )
+            _persist_if_refreshed(session)
         else:
             session.login_oauth_simple()
             _save_creds(session)
@@ -312,6 +355,30 @@ class TidalClient:
     def stream_track(self, track_id):
         track = self._get_session().track(track_id)
         return self._stream_track(track)
+
+    def download_url(self, track_id) -> str | None:
+        """One CDN URL for the whole track, so clients fetch bytes from Tidal.
+
+        Returns None when Tidal only offers this track as multiple segments,
+        which there is no way to express as a redirect.
+        """
+        session = self._get_session()
+        with _quality_lock:
+            previous = session.audio_quality
+            session.audio_quality = DOWNLOAD_QUALITY
+            try:
+                manifest = session.track(track_id).get_stream().get_stream_manifest()
+                urls = manifest.get_urls()
+            finally:
+                session.audio_quality = previous
+
+        if len(urls) != 1:
+            logger.warning(
+                "track %s is %d segments even at %s; no single URL to redirect to",
+                track_id, len(urls), DOWNLOAD_QUALITY,
+            )
+            return None
+        return urls[0]
 
     def raw_track(self, track_id):
         return self._get_session().track(track_id)

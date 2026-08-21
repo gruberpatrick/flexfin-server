@@ -1,5 +1,3 @@
-import uuid
-
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_pascal
 
@@ -147,7 +145,10 @@ class UserData(JellyModel):
     playback_position_ticks: int = 0
     is_favorite: bool = False
     played: bool = False
-    key: str = str(uuid.uuid4())
+    # Jellyfin's per-item user-data key. Callers pass the item id; the default
+    # used to be one str(uuid4()) evaluated at import, so every item in every
+    # response shared a single key and clients collapsed their user data.
+    key: str = ""
 
 
 class MediaStream(JellyModel):
@@ -175,7 +176,11 @@ class MediaSource(JellyModel):
     protocol: str = "Http"
     path: str = ""
     type: str = "Default"
-    container: str = "ts"
+    # Tidal delivers FLAC-in-fMP4 or AAC-in-MP4; never MPEG-TS, which is what
+    # this used to claim. Left as None for remote sources - we'd need a HEAD
+    # against the CDN per request to know it, and a wrong size is worse than
+    # none. A local copy can fill it in from the file on disk.
+    container: str = "mp4"
     size: int | None = None
     is_remote: bool = False
     etag: str = ""
@@ -185,6 +190,10 @@ class MediaSource(JellyModel):
     ignore_index: bool = False
     gen_pts_input: bool = False
     supports_transcoding: bool = True
+    # Deliberately false for Tidal sources. Advertising direct stream invites
+    # clients to pull bytes from /Items/<id>/File, which resolves to the
+    # single-file (lossy) rendition - that would silently downgrade playback
+    # from 24-bit FLAC to AAC. Only a local copy should set these true.
     supports_direct_stream: bool = False
     supports_direct_play: bool = False
     is_infinite_stream: bool = False
@@ -198,15 +207,25 @@ class MediaSource(JellyModel):
     required_http_headers: dict = {}
     transcoding_url: str | None = None
     transcoding_sub_protocol: str = "hls"
-    transcoding_container: str = "ts"
+    # The HLS playlist points at Tidal's fMP4 segments, not TS ones.
+    transcoding_container: str = "mp4"
 
     @classmethod
-    def hls_for(cls, item_id: str, run_time_ticks: int = 0) -> "MediaSource":
-        """Build a MediaSource that points clients at our HLS endpoint."""
+    def hls_for(cls, item_id: str, run_time_ticks: int = 0,
+                api_key: str | None = None) -> "MediaSource":
+        """Build a MediaSource that points clients at our HLS endpoint.
+
+        The token goes in the URL because that is what Jellyfin does and what
+        clients need: this URL is handed straight to a media player, which will
+        not be attaching authentication headers of its own.
+        """
+        query = f"MediaSourceId={item_id}"
+        if api_key:
+            query += f"&api_key={api_key}"
         return cls(
             id=item_id,
             run_time_ticks=run_time_ticks,
-            transcoding_url=f"/Audio/{item_id}/master.m3u8?MediaSourceId={item_id}",
+            transcoding_url=f"/Audio/{item_id}/master.m3u8?{query}",
         )
 
 
@@ -281,7 +300,7 @@ class Track(JellyModel):
     genres: list[str] = []
     genre_items: list[str] = []
     date_created: str = "2024-01-01T00:00:00.0000000Z"
-    container: str = "ts"
+    container: str = "mp4"          # see MediaSource.container
     type: str = "Audio"
     media_type: str = "Audio"
     is_folder: bool = False

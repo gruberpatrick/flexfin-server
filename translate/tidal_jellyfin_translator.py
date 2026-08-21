@@ -4,7 +4,7 @@ from flask import Response
 
 import db
 from schema.jellyfin import ResultWrapper, Artist, Album, Track, Playlist, MinimalArtistElements, UserData
-from tidal_client import TidalClient
+from tidal_client import TidalAuthError, TidalClient
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s",)
 log = logging.getLogger("subsonic-proxy")
@@ -69,8 +69,9 @@ def _user_data_for(user_id: str, item_id: str, *, with_play_count: bool = False)
     favorite = db.is_favorite(user_id, item_id)
     if with_play_count:
         play_count = db.get_play_count(user_id, item_id)
-        return UserData(is_favorite=favorite, play_count=play_count, played=play_count > 0)
-    return UserData(is_favorite=favorite)
+        return UserData(is_favorite=favorite, play_count=play_count,
+                        played=play_count > 0, key=item_id)
+    return UserData(is_favorite=favorite, key=item_id)
 
 
 def _to_artist_item(artist, user_id: str) -> Artist:
@@ -196,6 +197,10 @@ def get_track_stream(id):
     return TidalClient().stream_track(id)
 
 
+def get_track_download_url(id) -> str | None:
+    return TidalClient().download_url(id)
+
+
 def get_single_item_response(item_id: str, user_id: str) -> Response | None:
     """Fetch a single tidal item by prefixed id and return it as a Jellyfin item.
     Returns None if the prefix isn't recognized or the Tidal lookup fails."""
@@ -209,6 +214,11 @@ def get_single_item_response(item_id: str, user_id: str) -> Response | None:
             return _return_json(_to_artist_item(client.raw_artist(tid), user_id))
         if (tid := _strip_prefix(item_id, "tidal_playlist_")) is not None:
             return _return_json(_to_playlist_item(client.raw_playlist(tid), user_id))
+    except TidalAuthError:
+        # Don't swallow this one. Falling through to process_items() would
+        # answer 200 with an empty list, which looks like "Tidal has nothing"
+        # rather than "the proxy can't log in".
+        raise
     except Exception:
         log.exception("get_single_item failed for %s", item_id)
         return None
