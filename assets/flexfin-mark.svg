@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="21.24 35.43 57.14 57.14" width="128" height="128" role="img" aria-label="Flexfin">
+  <title>Flexfin</title>
+  <!-- Favicon / small-size variant. The wake and the gradient both turn to mud
+       below about 24px, so this is the bare fin in flat #388FE1, cropped to its
+       own bounds so it fills the space it is given. Same geometry as the full
+       logo, so the two read as one mark. -->
+  <path d="M46.66,44.00 L64.28,54.57 A11,11 0 0 1 64.28,73.43 L46.66,84.00 A11,11 0 0 1 30.00,74.57 L30.00,53.43 A11,11 0 0 1 46.66,44.00 Z" fill="#388FE1"/>
+</svg>

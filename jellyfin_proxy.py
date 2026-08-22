@@ -17,6 +17,7 @@ Environment:
 """
 
 import json
+import os
 import re
 import threading
 import uuid
@@ -66,6 +67,45 @@ class _NormalisePath:
 
 
 app.wsgi_app = _NormalisePath(app.wsgi_app)
+
+
+# Browser-based clients only. A native client has no same-origin policy to
+# satisfy, so nothing outside a browser is affected by any of this.
+CORS_ALLOW_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")
+
+# Every header a Jellyfin client might present a token in. A browser refuses to
+# send a header the preflight did not name, so an omission here shows up as a
+# 401 rather than as a CORS error, which is a slow thing to debug.
+_CORS_ALLOW_HEADERS = ", ".join([
+    "Authorization",
+    "Content-Type",
+    "X-Emby-Authorization",
+    "X-Emby-Token",
+    "X-MediaBrowser-Token",
+])
+
+
+@app.after_request
+def _allow_cross_origin(response):
+    """Let a browser-hosted client call this proxy.
+
+    Safe with a wildcard origin because authentication is a bearer token in a
+    header, never a cookie: we never set Access-Control-Allow-Credentials, so a
+    hostile page can only make unauthenticated calls, which get a 401. Set
+    CORS_ALLOW_ORIGIN to pin it to one origin if you would rather be strict.
+    """
+    response.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
+    response.headers["Access-Control-Allow-Headers"] = _CORS_ALLOW_HEADERS
+    response.headers["Access-Control-Allow-Methods"] = \
+        "GET, POST, DELETE, OPTIONS"
+    # Without this the browser re-preflights every request, which doubles the
+    # request count on a library that is mostly small JSON calls.
+    response.headers["Access-Control-Max-Age"] = "86400"
+    if CORS_ALLOW_ORIGIN != "*":
+        # Tell caches the body varies by origin, or a shared cache can serve
+        # one origin's response to another.
+        response.headers["Vary"] = "Origin"
+    return response
 
 
 def _register_case_insensitive_aliases(flask_app):
@@ -419,8 +459,17 @@ def audio_download(item_id):
     managers need. Concatenating DASH segments through here instead produced a
     chunked 200 with neither, which Finamp rejects outright.
 
-    When a local copy of a track exists this is the branch that should serve it
-    with send_file; until then every track comes from Tidal.
+    Note this deliberately does NOT return the HLS playlist that playback uses,
+    even though that would keep the audio lossless. Finamp's downloader wants a
+    single seekable file and will not assemble segments itself, so it needs one
+    URL it can range-request. The cost is real: only the lossy tier is served
+    as a single file (HI_RES_LOSSLESS is DASH only), so offline copies are AAC
+    while streaming stays 24-bit FLAC.
+
+    A client that can fetch and stitch the segments itself could be handed the
+    m3u8 here instead and keep lossless offline - the intended direction once
+    the Flexfin client can do that. Serving a local copy with send_file is the
+    other way to close the same gap; both belong on this branch.
     """
     if not item_id.startswith("tidal_track_"):
         return Response(status=404)

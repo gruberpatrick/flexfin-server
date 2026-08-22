@@ -1,3 +1,5 @@
+<img src="assets/flexfin-logo.svg" alt="" width="104">
+
 # flexfin-server
 
 The server half of Flexfin.

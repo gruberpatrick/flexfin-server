@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="22 15 98 98" width="128" height="128" role="img" aria-label="Flexfin">
+  <title>Flexfin</title>
+  <!-- viewBox is the measured content bounds plus 8 units of even padding, so
+       the mark is optically centred without relying on the artboard. -->
+  <defs>
+    <linearGradient id="ff-fin" x1="30" y1="42" x2="70" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5AA9EE"/>
+      <stop offset="0.55" stop-color="#388FE1"/>
+      <stop offset="1" stop-color="#2B72B9"/>
+    </linearGradient>
+  </defs>
+  <!-- Wake: two arcs radiating past the tip, reading as both sound and water. -->
+  <g fill="none" stroke="#388FE1" stroke-linecap="round">
+    <path d="M81.40,29.33 A62,62 0 0 1 81.40,98.67" stroke-width="9" opacity="0.34"/>
+    <path d="M99.50,28.59 A78,78 0 0 1 99.50,99.41" stroke-width="8" opacity="0.16"/>
+  </g>
+  <!-- Play triangle doubling as a dorsal fin. Corners rounded to r=11 with
+       arcs computed from the triangle (30,34) (80,64) (30,94). -->
+  <path d="M46.66,44.00 L64.28,54.57 A11,11 0 0 1 64.28,73.43 L46.66,84.00 A11,11 0 0 1 30.00,74.57 L30.00,53.43 A11,11 0 0 1 46.66,44.00 Z" fill="url(#ff-fin)"/>
+</svg>
