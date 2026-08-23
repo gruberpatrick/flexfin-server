@@ -179,39 +179,26 @@ class TidalClient:
     def _stream_track(self, track):
         stream = track.get_stream()
         manifest = stream.get_stream_manifest()
-
-        CODEC_MAP = {
-            "FLAC": "fLaC",
-            "MP4A": "mp4a.40.2",
-            "AACLC": "mp4a.40.2",
-            "HEAACV1": "mp4a.40.5",
-        }
-        codec_enum = manifest.codecs
-        codec_name = str(codec_enum).split(".")[-1].upper()
-        codec = CODEC_MAP.get(codec_name, "mp4a.40.2")
-
         seg_urls = manifest.get_urls()
+
         try:
             hls = manifest.get_hls()
         except Exception:
             # BTS streams are single-file (AAC/MP4) — tidalapi's get_hls() only
-            # handles MPD. Wrap the lone URL in a 1-segment HLS manifest so
-            # clients can always use the HLS playback path.
-            duration = max(int(track.duration or 1), 1)
-            hls = (
-                "#EXTM3U\n"
-                "#EXT-X-VERSION:3\n"
-                f"#EXT-X-TARGETDURATION:{duration + 1}\n"
-                "#EXT-X-MEDIA-SEQUENCE:0\n"
-                "#EXT-X-PLAYLIST-TYPE:VOD\n"
-                f"#EXTINF:{float(track.duration or duration):.3f},\n"
-                f"{seg_urls[0]}\n"
-                "#EXT-X-ENDLIST\n"
-            )
+            # handles MPD, and there is no segmented rendition to fall back to:
+            # this single URL already is the best Tidal has for this track, so
+            # the caller should just redirect to it rather than we invent a
+            # one-segment HLS wrapper around it (real HLS clients choke on a
+            # single "segment" spanning the whole track).
+            return {
+                "kind": "direct",
+                "url": seg_urls[0],
+                "seg_urls": seg_urls,
+                "duration": track.duration,
+            }
 
         return {
-            "mime": manifest.manifest_mime_type,
-            "codec": codec,
+            "kind": "hls",
             "seg_urls": seg_urls,
             "duration": track.duration,
             "hls": hls,

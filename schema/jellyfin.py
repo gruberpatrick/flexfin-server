@@ -212,20 +212,34 @@ class MediaSource(JellyModel):
 
     @classmethod
     def hls_for(cls, item_id: str, run_time_ticks: int = 0,
-                api_key: str | None = None) -> "MediaSource":
-        """Build a MediaSource that points clients at our HLS endpoint.
+                api_key: str | None = None, kind: str = "hls") -> "MediaSource":
+        """Build a MediaSource that points clients at the right playback URL.
 
         The token goes in the URL because that is what Jellyfin does and what
         clients need: this URL is handed straight to a media player, which will
         not be attaching authentication headers of its own.
+
+        [kind] is "hls" unless the caller already knows (from a live call to
+        Tidal, e.g. in /PlaybackInfo) that this track has no segmented
+        rendition, in which case it is "direct" and the client should be
+        pointed at the plain redirect endpoint instead of an HLS playlist.
+        Defaults to "hls" for callers that only need a placeholder MediaSource
+        (item listings) and are not about to pay for a live Tidal round trip
+        just to fill it in.
         """
         query = f"MediaSourceId={item_id}"
         if api_key:
             query += f"&api_key={api_key}"
+        path = (
+            f"/Audio/{item_id}/stream.mp4"
+            if kind == "direct"
+            else f"/Audio/{item_id}/master.m3u8"
+        )
         return cls(
             id=item_id,
             run_time_ticks=run_time_ticks,
-            transcoding_url=f"/Audio/{item_id}/master.m3u8?{query}",
+            transcoding_url=f"{path}?{query}",
+            transcoding_sub_protocol="http" if kind == "direct" else "hls",
         )
 
 

@@ -428,26 +428,59 @@ def playback_info(item_id):
     # some clients refuse a track. We know it for anything the translator has
     # surfaced, so use it.
     duration = db.get_track_duration(item_id) or 0
+
+    # A real call to Tidal, so the client is told the truth about whether this
+    # track is actually segmented before it commits to an HLS player for it.
+    kind = "hls"
+    if item_id.startswith("tidal_track_"):
+        stream = get_track_stream(item_id[len("tidal_track_"):])
+        kind = stream["kind"]
+
     source = MediaSource.hls_for(item_id, run_time_ticks=duration * 10_000_000,
-                                 api_key=g.token)
+                                 api_key=g.token, kind=kind)
     return jsonify({
         "MediaSources": [source.model_dump(by_alias=True)],
         "PlaySessionId": str(uuid.uuid4()),
     })
 
 
+def _resolve_stream(item_id):
+    if not item_id.startswith("tidal_track_"):
+        return None
+    return get_track_stream(item_id[len("tidal_track_"):])
+
+
+def _stream_response(stream):
+    """Serve whatever /PlaybackInfo promised: a real HLS playlist, or a plain
+    redirect for tracks Tidal never segmented in the first place."""
+    if stream["kind"] == "direct":
+        return redirect(stream["url"])
+    return Response(stream["hls"], mimetype="application/vnd.apple.mpegurl")
+
+
 @app.route("/Audio/<item_id>/main.m3u8")
 @app.route("/Audio/<item_id>/master.m3u8")
 @app.route("/Audio/<item_id>/stream.m3u8")
-@app.route("/Audio/<item_id>/stream")
-@app.route("/Audio/<item_id>/universal")
 def audio_hls(item_id):
     """HLS playlist. Segment URLs point straight at Tidal's CDN."""
-    if not item_id.startswith("tidal_track_"):
+    stream = _resolve_stream(item_id)
+    if stream is None:
         return Response(status=404)
-    track_id = item_id[len("tidal_track_"):]
-    stream = get_track_stream(track_id)
-    return Response(stream["hls"], mimetype="application/vnd.apple.mpegurl")
+    return _stream_response(stream)
+
+
+@app.route("/Audio/<item_id>/stream.mp4")
+@app.route("/Audio/<item_id>/stream.m4a")
+@app.route("/Audio/<item_id>/stream")
+@app.route("/Audio/<item_id>/universal")
+def audio_direct(item_id):
+    """Progressive playback for tracks with no segmented rendition. Also
+    accepts the two generic Jellyfin routes, for clients that hit those
+    without checking /PlaybackInfo first."""
+    stream = _resolve_stream(item_id)
+    if stream is None:
+        return Response(status=404)
+    return _stream_response(stream)
 
 
 @app.route("/Items/<item_id>/File")
