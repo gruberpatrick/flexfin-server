@@ -257,6 +257,10 @@ class Artist(JellyModel):
     user_data: UserData = UserData()
     image_tags: dict[str, str] = {}
     backdrop_image_tags: list[str] = []
+    # Kept so the merge layer can line a Tidal artist up with a Jellyfin one on a
+    # real identifier. Tidal exposes none for artists today, so this stays empty
+    # for Tidal-sourced artists.
+    provider_ids: dict[str, str] = {}
 
 
 class Album(JellyModel):
@@ -278,9 +282,12 @@ class Album(JellyModel):
     user_data: UserData = UserData()
     image_tags: dict[str, str] = {}
     backdrop_image_tags: list[str] = []
+    # Carries the album barcode/UPC ({"Barcode": "..."}) when Tidal supplies one,
+    # so the merge layer can dedupe against a Jellyfin album on it.
+    provider_ids: dict[str, str] = {}
 
     @classmethod
-    def create(cls, id, name, server_id, album_artist, artist_mapping, child_count, production_year, premiere_date, cover_id=None, user_data=None):
+    def create(cls, id, name, server_id, album_artist, artist_mapping, child_count, production_year, premiere_date, cover_id=None, user_data=None, provider_ids=None):
         return Album(
             id=id,
             name=name,
@@ -294,6 +301,7 @@ class Album(JellyModel):
             premiere_date=premiere_date,
             image_tags={"Primary": cover_id} if cover_id else {},
             user_data=user_data or UserData(),
+            provider_ids=provider_ids or {},
         )
 
 
@@ -330,9 +338,12 @@ class Track(JellyModel):
     parent_backdrop_image_tags: list[str] = []
     image_blur_hashes: dict = {}
     media_streams: list[MediaStream] = [MediaStream()]
+    # Carries the track ISRC ({"Isrc": "..."}) when Tidal supplies one, so the
+    # merge layer can dedupe against a Jellyfin track on it.
+    provider_ids: dict[str, str] = {}
 
     @classmethod
-    def create(cls, id, name, server_id, album, album_id, album_artist, artist_mapping, production_year, run_time_ticks, cover_id=None, index_number=1, parent_index_number=1, user_data=None):
+    def create(cls, id, name, server_id, album, album_id, album_artist, artist_mapping, production_year, run_time_ticks, cover_id=None, index_number=1, parent_index_number=1, user_data=None, provider_ids=None):
         return Track(
             id=id,
             name=name,
@@ -350,6 +361,7 @@ class Track(JellyModel):
             index_number=index_number,
             parent_index_number=parent_index_number,
             user_data=user_data or UserData(),
+            provider_ids=provider_ids or {},
         )
 
 

@@ -188,19 +188,27 @@ def verify_credentials(username: str, password: str, *, device_id: str) -> dict 
         return None
 
     try:
-        user = response.json()["User"]
+        payload = response.json()
+        user = payload["User"]
         user_id, user_name = user["Id"], user["Name"]
+        # The access token Jellyfin minted for this login. The merge layer reuses
+        # it to read the user's real library; keep it even if it is absent so a
+        # missing token degrades to Tidal-only rather than failing the login.
+        jf_token = payload.get("AccessToken")
     except (ValueError, KeyError, TypeError):
         log.exception("could not read the user out of Jellyfin's login response")
         return None
 
+    if not jf_token:
+        log.warning("Jellyfin login for %r returned no AccessToken; "
+                    "this session will get Tidal-only results", user_name)
     log.info("Jellyfin accepted %r (user id %s)", user_name, user_id)
-    return {"user_id": user_id, "user_name": user_name}
+    return {"user_id": user_id, "user_name": user_name, "jf_token": jf_token}
 
 
-def issue_token(user_id: str, user_name: str) -> str | None:
+def issue_token(user_id: str, user_name: str, jf_token: str | None = None) -> str | None:
     token = secrets.token_urlsafe(32)
-    if not db.create_session(token, user_id, user_name, TOKEN_TTL_DAYS):
+    if not db.create_session(token, user_id, user_name, TOKEN_TTL_DAYS, jf_token):
         log.error("could not store the session for %s; refusing the login", user_id)
         return None
     return token

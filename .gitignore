@@ -1,4 +1,6 @@
 *tidal_creds.json
+.env
+.env.local
 *.cpython*
 *.DS_Store
 *__pycache__*

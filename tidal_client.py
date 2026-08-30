@@ -9,7 +9,10 @@ import shutil
 import threading
 
 import tidalapi
+from dotenv import load_dotenv
 from mutagen.flac import FLAC
+
+load_dotenv()  # pick up ./.env when run on its own (e.g. `make tidal-login`)
 
 logging.basicConfig()
 logging.getLogger().setLevel(logging.INFO)

@@ -3,9 +3,9 @@
 # flexfin-server
 
 The server half of Flexfin.
-A Flask app that speaks the Jellyfin API and serves Tidal as the library.
+A Flask app that speaks the Jellyfin API and serves a merged library: the user's real Jellyfin library plus Tidal.
 
-Point any Jellyfin client at it and you can browse, search and play Tidal without the client knowing Tidal exists.
+Point any Jellyfin client at it and you can browse, search and play both, without the client knowing Tidal exists.
 Tested with Finamp and Feishin, and the intended companion is the Flexfin client.
 
 Login is delegated to a real Jellyfin instance, so the server holds no user accounts and no passwords of its own.
@@ -13,19 +13,22 @@ Login is delegated to a real Jellyfin instance, so the server holds no user acco
 ## How it works
 
 Flexfin translates Jellyfin API calls into [tidalapi](https://github.com/tamland/python-tidal) calls and renders the results as Jellyfin JSON.
-Item ids are Tidal ids with a type prefix: `tidal_track_`, `tidal_album_`, `tidal_artist_`, `tidal_playlist_`.
+Tidal item ids carry a type prefix: `tidal_track_`, `tidal_album_`, `tidal_artist_`, `tidal_playlist_`. Real Jellyfin items keep their native GUIDs, untouched.
 
-Audio never passes through the server.
-Playback returns an HLS playlist whose segments are Tidal CDN URLs, and downloads return a 302 to a single Tidal CDN URL, so the client fetches bytes directly from Tidal.
-It only ever carries JSON and playlists.
+Browse and search go through `merge.py`, which asks both sources and folds the results together.
+The access token the real Jellyfin issues at login is kept (`sessions.jf_token`) and reused to read that user's library as them.
+A Tidal item is dropped in favour of a Jellyfin one only when the two carry the same real identifier: ISRC for tracks, barcode/UPC for albums. No identifier, or no match, and both entries stay.
 
-A sqlite database caches every item the server surfaces, which feeds the image endpoint and per-track user data, and stores favourites, play counts and sessions.
+Audio and images never pass through the server.
+A Tidal item redirects to Tidal's CDN; a local item redirects to the Jellyfin server itself (`JELLYFIN_PUBLIC_URL`). The process only ever carries JSON and playlists.
+
+A sqlite database caches every Tidal item the server surfaces, which feeds the image endpoint and per-track user data, and stores favourites, play counts, sessions, and the Tidal↔Jellyfin identifier matches (`source_map`).
 
 ## Requirements
 
 - Python 3.10 or newer
 - A Tidal subscription
-- A reachable Jellyfin instance, used only to verify logins
+- A reachable Jellyfin instance, used to verify logins and to read the library
 
 ## Getting started
 
@@ -61,9 +64,17 @@ Do not rely on this happening by itself on the first request.
 ### Run it
 
 ```bash
-export JELLYFIN_URL=http://your-jellyfin:8096
-.venv/bin/python jellyfin_proxy.py                        # dev server on :8096
-.venv/bin/gunicorn -b 0.0.0.0:8096 jellyfin_proxy:app     # or under gunicorn
+export JELLYFIN_URL=http://your-jellyfin:8096         # or put it in .env, see below
+.venv/bin/python main.py                              # dev server on :8096
+.venv/bin/gunicorn -b 0.0.0.0:8096 server:app        # or under gunicorn
+```
+
+Or via `make`, which creates the venv and installs requirements on first use:
+
+```bash
+make run                     # dev server on :8096
+make serve                   # under gunicorn (HOST=/PORT= to override)
+make tidal-login             # the one-time Tidal sign-in above
 ```
 
 Now point your client at Flexfin and log in with your **Jellyfin** username and password.
@@ -71,11 +82,17 @@ It forwards them to `JELLYFIN_URL` and, if Jellyfin accepts, issues its own toke
 
 ## Configuration
 
-Everything is environment variables.
+Everything is environment variables. For local runs, copy `.env.example` to
+`.env` and edit it — `server.py` (and `tidal_client.py`) load `.env` on startup.
+Real environment variables override the file, and `.env` is gitignored.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `JELLYFIN_URL` | none | Jellyfin base URL used to verify logins. Unset means every login is refused. |
+| `JELLYFIN_URL` | none | Jellyfin base URL, used to verify logins and to read the library. Unset means every login is refused. |
+| `JELLYFIN_PUBLIC_URL` | `JELLYFIN_URL` | Base URL the *client* uses to fetch audio and images for local items. Set it when clients are not on the Jellyfin LAN and need a publicly reachable host; otherwise local-item playback and art only work for LAN clients. |
+| `MERGE_LOCAL_LIBRARY` | `true` | Set to `false` to serve Tidal only, ignoring the Jellyfin library (the pre-merge behaviour). |
+| `MERGE_TAG_SOURCE` | `false` | Testing aid: prefix every item name with `[J] ` or `[T] ` so it is visible in any client which source it came from. |
+| `JELLYFIN_API_TIMEOUT` | `10` | Seconds to wait for a Jellyfin library call before falling back to Tidal-only results. |
 | `PROXY_DB_PATH` | `./data/proxy.db` | sqlite cache, user data and sessions. |
 | `LIKED_TRACKS_DIR` | `/mnt/Main/Apps/music_files` | Where marker files for liked items are written. |
 | `TIDAL_DOWNLOAD_QUALITY` | `LOSSLESS` | Tier requested for downloads. See the note below. |
@@ -119,15 +136,16 @@ Every client also has to log in again, because the old build handed out a fixed 
 ## Roadmap
 
 The point of authenticating against a real Jellyfin server is not just to check passwords.
-The plan is to integrate with that same authenticated session and serve a single merged library, resolving each item to whichever source actually has it.
+Reading the real Jellyfin library through the authenticated session and merging it with Tidal results is now done (`merge.py`): one client sees both, and where a track or album carries the same ISRC or barcode on both sides the Tidal copy is dropped in favour of the local one.
 
-- Read the real Jellyfin library through the authenticated session and merge it with Tidal results, so one client sees both.
-- Resolve each item to a source at request time: a local copy when one exists, Tidal otherwise.
-- Prefer local files for downloads, which is what closes the quality gap described below, since a local copy can be served with `send_file` and full range support.
+What is left:
 
-Two properties matter when that lands.
-Source selection belongs in one function shared by the download, `PlaybackInfo` and HLS paths, because splitting it produces the case where downloads come from a local file while playback still streams from Tidal.
-And the chosen source must never change an item's id or `MediaSource.Id`, or favourites, play counts and existing offline downloads are invalidated the moment a local copy appears.
+- **Fuzzy matching.** Dedupe only happens on an exact identifier match. A release with no ISRC/UPC on one side shows up twice.
+- **Stable item ids across sources.** An item's id is simply its source's id today, so a Tidal favourite or play count goes stale the moment a local copy appears under a Jellyfin GUID. Items should resolve to a source at request time while keeping their id and `MediaSource.Id` fixed.
+- **One shared source-selection function** for the download, `PlaybackInfo` and HLS paths, so a download can never come from a local file while playback still streams from Tidal (or vice versa).
+- **Lossless downloads.** Serve local files with `send_file` and range support, which is what closes the quality gap in Known limitations below.
+- **Sync favourites and play counts** to and from the real Jellyfin user data, instead of keeping them only in this server's sqlite.
+- **Merge `/Genres` and `Similar`.** Both still return empty.
 
 ## Known limitations
 
@@ -150,7 +168,19 @@ Nothing private is exposed, only public Tidal artwork, but a prober can learn wh
 Under gunicorn with several workers the effective allowance is multiplied by the worker count, and it resets on restart.
 It also has no per username counter, so an attacker with rotating addresses is not slowed.
 
-**Session tokens are stored in plaintext** in the sqlite database.
+**Session tokens are stored in plaintext** in the sqlite database. The Jellyfin access token (`sessions.jf_token`) is stored the same way.
+
+**A session created before the merge landed has no Jellyfin token.**
+Those requests get Tidal-only results until the client logs in again.
+
+**Local items need `JELLYFIN_PUBLIC_URL` reachable by the client.**
+Audio and images for local items are a 302 to the Jellyfin server. If a remote client cannot reach that URL it still *sees* local-only items in listings but cannot play them or load their art. Tidal items are unaffected.
+
+**`TotalRecordCount` is approximate on merged responses.**
+Each source is asked for up to `Limit` items and the merged list is sliced to a page, so paging past the first page of a large merged result is unreliable. This was already true of the Tidal-only paths.
+
+**Artists are never deduplicated.**
+Tidal exposes no cross-catalog identifier for an artist, so a Tidal artist and a Jellyfin artist for the same person show up as two entries.
 
 ## Exposing it
 

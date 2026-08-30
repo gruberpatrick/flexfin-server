@@ -1,3 +1,4 @@
+import json
 import logging
 
 from flask import Response
@@ -86,9 +87,20 @@ def _to_artist_item(artist, user_id: str) -> Artist:
     )
 
 
+def _barcode_of(album) -> str | None:
+    """Tidal's UPC/EAN for a release, whichever attribute the library exposes it
+    under. Used only to line an album up with its Jellyfin twin."""
+    for attr in ("universal_product_number", "upc", "barcode"):
+        value = getattr(album, attr, None)
+        if value:
+            return str(value).strip()
+    return None
+
+
 def _to_album_item(album, user_id: str) -> Album:
     _cache_album(album)
     item_id = f"tidal_album_{album.id}"
+    barcode = _barcode_of(album)
     return Album.create(
         id=item_id,
         name=album.name,
@@ -100,6 +112,7 @@ def _to_album_item(album, user_id: str) -> Album:
         premiere_date=album.release_date.isoformat() if album.release_date else "",
         cover_id=album.cover,
         user_data=_user_data_for(user_id, item_id),
+        provider_ids={"Barcode": barcode} if barcode else None,
     )
 
 
@@ -151,6 +164,7 @@ def _to_track_item(track, user_id: str) -> Track:
 
     item_id = f"tidal_track_{track.id}"
     user_data = _user_data_for(user_id, item_id, with_play_count=True)
+    isrc = getattr(track, "isrc", None)
 
     return Track.create(
         id=item_id,
@@ -166,6 +180,7 @@ def _to_track_item(track, user_id: str) -> Track:
         index_number=track.track_num or 1,
         parent_index_number=track.volume_num or 1,
         user_data=user_data,
+        provider_ids={"Isrc": str(isrc).strip()} if isrc else None,
     )
 
 
@@ -201,23 +216,29 @@ def get_track_download_url(id) -> str | None:
     return TidalClient().download_url(id)
 
 
-def get_single_item_response(item_id: str, user_id: str) -> Response | None:
-    """Fetch a single tidal item by prefixed id and return it as a Jellyfin item.
-    Returns None if the prefix isn't recognized or the Tidal lookup fails."""
+def _dump(models: list) -> list[dict]:
+    """Jellyfin-JSON dicts for a list of schema models, so the merge layer can
+    hold Tidal and real-Jellyfin items in the same shape."""
+    return [m.model_dump(by_alias=True) for m in models]
+
+
+def get_single_item(item_id: str, user_id: str) -> dict | None:
+    """One Tidal item, by prefixed id, as a Jellyfin-JSON dict.
+
+    Returns None if the prefix isn't a Tidal one or the lookup fails. Raises
+    TidalAuthError so a login problem isn't mistaken for "Tidal has nothing".
+    """
     client = TidalClient()
     try:
         if (tid := _strip_prefix(item_id, "tidal_track_")) is not None:
-            return _return_json(_to_track_item(client.raw_track(tid), user_id))
+            return _to_track_item(client.raw_track(tid), user_id).model_dump(by_alias=True)
         if (tid := _strip_prefix(item_id, "tidal_album_")) is not None:
-            return _return_json(_to_album_item(client.raw_album(tid), user_id))
+            return _to_album_item(client.raw_album(tid), user_id).model_dump(by_alias=True)
         if (tid := _strip_prefix(item_id, "tidal_artist_")) is not None:
-            return _return_json(_to_artist_item(client.raw_artist(tid), user_id))
+            return _to_artist_item(client.raw_artist(tid), user_id).model_dump(by_alias=True)
         if (tid := _strip_prefix(item_id, "tidal_playlist_")) is not None:
-            return _return_json(_to_playlist_item(client.raw_playlist(tid), user_id))
+            return _to_playlist_item(client.raw_playlist(tid), user_id).model_dump(by_alias=True)
     except TidalAuthError:
-        # Don't swallow this one. Falling through to process_items() would
-        # answer 200 with an empty list, which looks like "Tidal has nothing"
-        # rather than "the proxy can't log in".
         raise
     except Exception:
         log.exception("get_single_item failed for %s", item_id)
@@ -225,11 +246,25 @@ def get_single_item_response(item_id: str, user_id: str) -> Response | None:
     return None
 
 
-def playlist_tracks_response(playlist_id: str, user_id: str, start_index: int = 0) -> Response:
-    """Return the Audio items for a Tidal playlist, in the Jellyfin Items shape."""
+def get_single_item_response(item_id: str, user_id: str) -> Response | None:
+    item = get_single_item(item_id, user_id)
+    return _return_json_dict(item) if item is not None else None
+
+
+def collect_playlist_tracks(playlist_id: str, user_id: str) -> list[dict]:
+    """The Audio items for a Tidal playlist, as Jellyfin-JSON dicts."""
     tidal_id = _strip_prefix(playlist_id, "tidal_playlist_") or playlist_id
     tracks = TidalClient().tracks_for_playlist(tidal_id)
-    return _wrap([_to_track_item(t, user_id) for t in tracks], start_index)
+    return _dump([_to_track_item(t, user_id) for t in tracks])
+
+
+def playlist_tracks_response(playlist_id: str, user_id: str, start_index: int = 0) -> Response:
+    """Return the Audio items for a Tidal playlist, in the Jellyfin Items shape."""
+    return _wrap(collect_playlist_tracks(playlist_id, user_id), start_index)
+
+
+def _return_json_dict(payload) -> Response:
+    return Response(json.dumps(payload), mimetype="application/json")
 
 
 def _wrap(items: list, start_index: int) -> Response:
@@ -262,8 +297,12 @@ def _tracks_for_artists(artist_ids: list[str], limit: int):
     return out
 
 
-def process_items(request, types: list[str] = None, user_id: str | None = None):
+def collect_items(request, types: list[str] = None, user_id: str | None = None) -> list[dict]:
+    """The Tidal half of a browse/search, as Jellyfin-JSON dicts.
 
+    Same branching as the old process_items, but it returns the list so the
+    merge layer can fold in the real Jellyfin library before wrapping.
+    """
     search_term, include_types, limit, start_index = _get_search_params(request)
     if types is None:
         types = [t.strip() for t in include_types.split(",") if t.strip()]
@@ -279,11 +318,11 @@ def process_items(request, types: list[str] = None, user_id: str | None = None):
 
     if "Playlist" in types:
         playlists = _get_playlists(search_term, limit)
-        return _wrap([_to_playlist_item(p, user_id) for p in playlists], start_index)
+        return _dump([_to_playlist_item(p, user_id) for p in playlists])
 
     if "MusicArtist" in types:
         artists = _get_artists(search_term, limit)
-        return _wrap([_to_artist_item(a, user_id) for a in artists], start_index)
+        return _dump([_to_artist_item(a, user_id) for a in artists])
 
     if "MusicAlbum" in types:
         if artist_ids:
@@ -292,7 +331,7 @@ def process_items(request, types: list[str] = None, user_id: str | None = None):
             albums = TidalClient().albums_for_artist(artist_tidal_id, limit=limit)
         else:
             albums = _get_albums(search_term, limit)
-        return _wrap([_to_album_item(a, user_id) for a in albums], start_index)
+        return _dump([_to_album_item(a, user_id) for a in albums])
 
     if "Audio" in types:
         if (album_tidal_id := _strip_prefix(parent_id, "tidal_album_")) is not None:
@@ -305,6 +344,11 @@ def process_items(request, types: list[str] = None, user_id: str | None = None):
             tracks = TidalClient().top_tracks_for_artist(artist_tidal_id, limit=limit)
         else:
             tracks = _get_tracks(search_term, limit)
-        return _wrap([_to_track_item(t, user_id) for t in tracks], start_index)
+        return _dump([_to_track_item(t, user_id) for t in tracks])
 
-    return _wrap([], start_index)
+    return []
+
+
+def process_items(request, types: list[str] = None, user_id: str | None = None) -> Response:
+    start_index = int(request.args.get("StartIndex", "0"))
+    return _wrap(collect_items(request, types, user_id), start_index)

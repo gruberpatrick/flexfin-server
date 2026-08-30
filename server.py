@@ -1,15 +1,23 @@
 """
-Jellyfin API proxy that serves Tidal as the library.
+Jellyfin API proxy that serves a merged library: the user's real Jellyfin
+library plus Tidal.
 
-Tracks stream as HLS with the segments served straight from Tidal's CDN;
-downloads redirect there too, so audio never crosses this process.
+All the routes live here; `main.py` is the entrypoint (or `gunicorn server:app`).
+Browse and search go through merge.py, which asks both sources and folds them
+together. Audio and images never cross this process - a Tidal item redirects to
+Tidal's CDN, a local item redirects to the Jellyfin server (JELLYFIN_PUBLIC_URL).
 
 Login is delegated to a real Jellyfin instance - set JELLYFIN_URL and sign in
-with those credentials. Every endpoint except /System/Info, /System/Ping and
+with those credentials. The access token Jellyfin issues is kept and reused to
+read that user's library. Every endpoint except /System/Info, /System/Ping and
 /Users/AuthenticateByName requires the token handed out at login.
 
 Environment:
-    JELLYFIN_URL            Jellyfin base URL  (default http://192.168.1.78:30013)
+    JELLYFIN_URL            Jellyfin base URL, used for login + library reads
+    JELLYFIN_PUBLIC_URL     Jellyfin URL the client uses for audio/images
+                            (default: JELLYFIN_URL)
+    MERGE_LOCAL_LIBRARY     "false" to serve Tidal only (default true)
+    JELLYFIN_API_TIMEOUT    seconds to wait on a library call (default 10)
     PROXY_DB_PATH           sqlite cache + sessions   (default ./data/proxy.db)
     LIKED_TRACKS_DIR        marker files for likes    (default /mnt/Main/Apps/music_files)
     TIDAL_DOWNLOAD_QUALITY  tier used for downloads   (default LOSSLESS)
@@ -22,8 +30,14 @@ import re
 import threading
 import uuid
 import requests
+from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request, Response, abort, redirect, stream_with_context
 import logging
+
+# Load ./.env before importing anything that reads os.environ at import time
+# (auth.py, jellyfin_client.py). Real environment variables always win over the
+# file, so this is a convenience for local runs, not an override.
+load_dotenv()
 
 from schema.jellyfin import (
     AuthResponse, User, SessionInfo, SystemInfo, Album, Artist, Track, ResultWrapper, UserData, MediaSource
@@ -32,9 +46,11 @@ from schema.jellyfin import (
 import auth
 import db
 import like_markers
+import merge
+from jellyfin_client import JellyfinClient
+from merge import LIBRARY_ID
 from translate.tidal_jellyfin_translator import (
-    process_items, get_track_stream, get_track_download_url,
-    playlist_tracks_response, get_single_item_response, SERVER_ID,
+    get_track_stream, get_track_download_url, SERVER_ID,
 )
 
 app = Flask(__name__)
@@ -142,11 +158,9 @@ def _register_case_insensitive_aliases(flask_app):
 # ---- Fixed IDs so clients can cache consistently ----
 # The user id is no longer among them: it comes from the Jellyfin instance that
 # authenticated the request. db.DEFAULT_USER_ID is only the pre-auth placeholder
-# that remap_user.py migrates away from.
-LIBRARY_ID = "22222222-2222-2222-2222-222222222222"
-ALBUM_ID = "33333333-3333-3333-3333-333333333333"
-ARTIST_ID = "44444444-4444-4444-4444-444444444444"
-TRACK_ID = "55555555-5555-5555-5555-555555555555"
+# that remap_user.py migrates away from. LIBRARY_ID and the other synthetic
+# container ids live in merge.py, which needs them to tell a top-level browse
+# from a request scoped to a real Jellyfin container.
 
 
 def _return_json(model: any) -> Response:
@@ -286,7 +300,8 @@ def authenticate():
                  username, client, remaining)
         return _unauthorised("Invalid username or password.")
 
-    token = auth.issue_token(identity["user_id"], identity["user_name"])
+    token = auth.issue_token(identity["user_id"], identity["user_name"],
+                             identity.get("jf_token"))
     if token is None:
         return _unauthorised("Could not start a session.", status=500)
 
@@ -375,9 +390,10 @@ def root_items(user_id):
 def items(user_id=None):
     """
     Handles the big catchall endpoint Finamp uses to browse the library.
-    Returns albums or tracks depending on IncludeItemTypes.
+    Returns albums or tracks depending on IncludeItemTypes, merged from the
+    real Jellyfin library and Tidal.
     """
-    return process_items(request, user_id=_user_id_from(user_id))
+    return merge.browse(request, _user_id_from(user_id))
 
 
 @app.route("/Users/<user_id>/Items/<item_id>")
@@ -386,10 +402,10 @@ def items(user_id=None):
 @app.route("/items/<item_id>")
 def get_item(item_id, user_id=None):
     uid = _user_id_from(user_id)
-    response = get_single_item_response(item_id, uid)
+    response = merge.single_item(request, item_id, uid)
     if response is not None:
         return response
-    return process_items(request, user_id=uid)
+    return merge.browse(request, uid)
 
 
 @app.route("/Items/Filters")
@@ -414,16 +430,47 @@ def similar(album_id=None, artist_id=None):
 @app.route("/Artists/AlbumArtists")
 @app.route("/artists/albumArtists")
 def album_artists():
-    return process_items(request, types=["MusicArtist"],
-                         user_id=_user_id_from())
+    return merge.artists(request, _user_id_from())
 
 
 # ============================================================
 # Playback
 # ============================================================
 
+def _jellyfin_stream_client() -> JellyfinClient:
+    return JellyfinClient(g.session["jf_token"] if getattr(g, "session", None) else None)
+
+
 @app.route("/Items/<item_id>/PlaybackInfo", methods=["GET", "POST"])
 def playback_info(item_id):
+    # A local (real-Jellyfin) item: point the client straight at the Jellyfin
+    # server for the bytes, with our own /Audio route as the fallback for
+    # clients that ignore the MediaSource URL. Runtime is already on the item
+    # itself from the browse response, so it isn't repeated here.
+    if merge.is_jellyfin_id(item_id):
+        client = _jellyfin_stream_client()
+        # Progressive, not HLS: just_audio_web has no hls.js and Chrome has no
+        # native HLS, so a playlist URL fails on web. Our /Audio/<id>/universal
+        # route 302s to Jellyfin's direct-stream (a seekable single file), which
+        # a browser <audio> and mpv both play.
+        transcoding_url = f"/Audio/{item_id}/universal?MediaSourceId={item_id}"
+        if g.token:
+            transcoding_url += f"&api_key={g.token}"
+        source = MediaSource(
+            id=item_id,
+            path=client.stream_url(item_id),
+            protocol="Http",
+            is_remote=True,
+            supports_direct_stream=True,
+            supports_direct_play=True,
+            transcoding_url=transcoding_url,
+            transcoding_sub_protocol="http",
+        )
+        return jsonify({
+            "MediaSources": [source.model_dump(by_alias=True)],
+            "PlaySessionId": str(uuid.uuid4()),
+        })
+
     # Duration was previously reported as 0, which is enough on its own to make
     # some clients refuse a track. We know it for anything the translator has
     # surfaced, so use it.
@@ -462,7 +509,10 @@ def _stream_response(stream):
 @app.route("/Audio/<item_id>/master.m3u8")
 @app.route("/Audio/<item_id>/stream.m3u8")
 def audio_hls(item_id):
-    """HLS playlist. Segment URLs point straight at Tidal's CDN."""
+    """HLS playlist. Segment URLs point straight at Tidal's CDN. A local item
+    is a 302 to the Jellyfin server, which owns the bytes."""
+    if merge.is_jellyfin_id(item_id):
+        return redirect(_jellyfin_stream_client().stream_url(item_id))
     stream = _resolve_stream(item_id)
     if stream is None:
         return Response(status=404)
@@ -476,7 +526,9 @@ def audio_hls(item_id):
 def audio_direct(item_id):
     """Progressive playback for tracks with no segmented rendition. Also
     accepts the two generic Jellyfin routes, for clients that hit those
-    without checking /PlaybackInfo first."""
+    without checking /PlaybackInfo first. A local item is a 302 to Jellyfin."""
+    if merge.is_jellyfin_id(item_id):
+        return redirect(_jellyfin_stream_client().stream_url(item_id))
     stream = _resolve_stream(item_id)
     if stream is None:
         return Response(status=404)
@@ -503,7 +555,13 @@ def audio_download(item_id):
     m3u8 here instead and keep lossless offline - the intended direction once
     the Flexfin client can do that. Serving a local copy with send_file is the
     other way to close the same gap; both belong on this branch.
+
+    A local (real-Jellyfin) item is a 302 to the Jellyfin server's own download
+    URL, which already gives the range support and Content-Length a download
+    manager needs.
     """
+    if merge.is_jellyfin_id(item_id):
+        return redirect(_jellyfin_stream_client().download_url(item_id))
     if not item_id.startswith("tidal_track_"):
         return Response(status=404)
     track_id = item_id[len("tidal_track_"):]
@@ -541,6 +599,12 @@ _TRANSPARENT_PNG = bytes.fromhex(
 @app.route("/Items/<item_id>/Images/<image_type>")
 @app.route("/Items/<item_id>/Images/<image_type>/<int:image_index>")
 def item_image(item_id, image_type, image_index=0):
+    # A local (real-Jellyfin) item: 302 to the Jellyfin server, which serves its
+    # own art anonymously. Needs JELLYFIN_PUBLIC_URL to be reachable by the
+    # client - see the README.
+    if merge.is_jellyfin_id(item_id):
+        return redirect(JellyfinClient.image_url(item_id, image_type, request.args))
+
     # image_type comes out of the path, so it arrives lowercased via the
     # lowercase route aliases as well as capitalised.
     if image_type.lower() != "primary":
@@ -684,14 +748,14 @@ def genres():
 
 @app.route("/Playlists")
 def playlists():
-    return jsonify({"Items": [], "TotalRecordCount": 0, "StartIndex": 0})
+    # Tidal only surfaces playlists for a search term; the real Jellyfin lists
+    # the user's own, so this endpoint is now useful even with no SearchTerm.
+    return merge.browse(request, _user_id_from(), types=["Playlist"])
 
 
 @app.route("/Playlists/<playlist_id>/Items")
 def playlist_items(playlist_id):
-    user_id = _user_id_from()
-    start_index = int(request.args.get("StartIndex", "0"))
-    return playlist_tracks_response(playlist_id, user_id=user_id, start_index=start_index)
+    return merge.playlist_items(request, playlist_id, _user_id_from())
 
 
 # Must come last: it mirrors whatever is registered above.
@@ -699,4 +763,6 @@ _register_case_insensitive_aliases(app)
 
 
 if __name__ == "__main__":
+    # Prefer `python main.py` (it does a couple of startup checks first); this
+    # stays so `python server.py` still works.
     app.run(host="0.0.0.0", port=8096, debug=True)

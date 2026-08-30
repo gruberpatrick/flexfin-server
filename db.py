@@ -156,10 +156,33 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             user_id TEXT NOT NULL,
             user_name TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
+            expires_at TEXT NOT NULL,
+            jf_token TEXT
         );
         CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
+
+        -- Records that a Tidal item and a Jellyfin library item are the same
+        -- release, matched on a real identifier (ISRC for tracks, barcode/UPC
+        -- for albums). The merge layer writes a row whenever it collapses a
+        -- Tidal result into its local twin; nothing reads it yet, but it is the
+        -- store the future "keep the Tidal id, play the local file" work needs.
+        CREATE TABLE IF NOT EXISTS source_map (
+            tidal_id TEXT NOT NULL,
+            jellyfin_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            match_key TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tidal_id, jellyfin_id)
+        );
     """)
+
+    # jf_token was added after the first release. A database created before then
+    # has the sessions table without it, and CREATE TABLE IF NOT EXISTS above
+    # won't touch it, so patch it in once.
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "jf_token" not in have:
+        conn.execute("ALTER TABLE sessions ADD COLUMN jf_token TEXT")
+        log.info("added sessions.jf_token to %s", DB_PATH)
 
 
 def _safe_execute(sql: str, params: tuple, op: str) -> bool:
@@ -273,6 +296,23 @@ def upsert_track(
          _s(artist_id), _s(artist_name),
          _i(duration), _i(track_num), _i(volume_num), _i(year), _now()),
         op="upsert_track",
+    )
+
+
+def upsert_source_map(tidal_id: str, jellyfin_id: str, kind: str,
+                      match_key: str | None) -> bool:
+    """Note that a Tidal item and a Jellyfin library item are the same release.
+
+    Written by the merge layer when it collapses a Tidal result into its local
+    twin. Best effort, like every other write here.
+    """
+    return _safe_execute(
+        "INSERT INTO source_map(tidal_id, jellyfin_id, kind, match_key, created_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(tidal_id, jellyfin_id) DO UPDATE SET "
+        "kind=excluded.kind, match_key=excluded.match_key",
+        (_s(tidal_id), _s(jellyfin_id), _s(kind), _s(match_key), _now()),
+        op="upsert_source_map",
     )
 
 
@@ -396,26 +436,34 @@ def is_favorite(user_id: str, item_id: str) -> bool:
 # token it earned so every later request can be checked with one indexed lookup
 # instead of another round trip to Jellyfin.
 
-def create_session(token: str, user_id: str, user_name: str, ttl_days: int) -> bool:
+def create_session(token: str, user_id: str, user_name: str, ttl_days: int,
+                   jf_token: str | None = None) -> bool:
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     expires = now + datetime.timedelta(days=ttl_days)
     return _safe_execute(
-        "INSERT INTO sessions(token, user_id, user_name, created_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?) "
+        "INSERT INTO sessions(token, user_id, user_name, created_at, expires_at, jf_token) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(token) DO UPDATE SET "
         "user_id=excluded.user_id, user_name=excluded.user_name, "
-        "created_at=excluded.created_at, expires_at=excluded.expires_at",
-        (token, user_id, user_name, now.isoformat(), expires.isoformat()),
+        "created_at=excluded.created_at, expires_at=excluded.expires_at, "
+        "jf_token=excluded.jf_token",
+        (token, user_id, user_name, now.isoformat(), expires.isoformat(), jf_token),
         op="create_session",
     )
 
 
-def lookup_session(token: str) -> dict[str, str] | None:
-    """Return the session for a token, or None if unknown or expired."""
+def lookup_session(token: str) -> dict[str, str | None] | None:
+    """Return the session for a token, or None if unknown or expired.
+
+    jf_token is the access token the real Jellyfin issued at login; the merge
+    layer calls Jellyfin as this user with it. It is None for sessions created
+    before that was captured - those users get Tidal-only results until they
+    log in again.
+    """
     if not token:
         return None
     row = get_conn().execute(
-        "SELECT user_id, user_name, expires_at FROM sessions WHERE token=?",
+        "SELECT user_id, user_name, expires_at, jf_token FROM sessions WHERE token=?",
         (token,),
     ).fetchone()
     if row is None:
@@ -424,7 +472,8 @@ def lookup_session(token: str) -> dict[str, str] | None:
         log.info("token for user %s expired at %s", row["user_id"], row["expires_at"])
         delete_session(token)
         return None
-    return {"user_id": row["user_id"], "user_name": row["user_name"]}
+    return {"user_id": row["user_id"], "user_name": row["user_name"],
+            "jf_token": row["jf_token"]}
 
 
 def delete_session(token: str) -> bool:
@@ -475,6 +524,7 @@ TABLES = {
     "play_counts": "last_played_at",
     "favorites": "created_at",
     "sessions": "created_at",
+    "source_map": "created_at",
 }
 
 

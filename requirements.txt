@@ -3,3 +3,4 @@ mutagen==1.47.0
 flask==3.1.2
 gunicorn==25.2.0
 pydantic==2.11.7
+python-dotenv==1.2.3
