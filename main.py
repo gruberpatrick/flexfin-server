@@ -26,4 +26,8 @@ def _preflight() -> None:
 
 if __name__ == "__main__":
     _preflight()
-    app.run(host="0.0.0.0", port=8096, debug=True)
+    # threaded: every request fans out to Jellyfin and Tidal, and clients such
+    # as Jellify fire a burst of parallel calls per screen. Single-threaded, one
+    # slow upstream read stalls the whole queue behind it. db.py already keeps a
+    # connection per thread. For real load use `gunicorn server:app`.
+    app.run(host="0.0.0.0", port=8096, debug=True, threaded=True)

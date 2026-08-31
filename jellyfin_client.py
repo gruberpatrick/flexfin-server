@@ -71,11 +71,12 @@ class JellyfinClient:
     def _get(self, path: str, params: dict | None = None) -> dict | None:
         if not self.token:
             return None
+        log.debug("Jellyfin GET %s params=%s", path, params)
         try:
             resp = requests.get(f"{JELLYFIN_URL}{path}", params=params or {},
                                 headers=self._headers(), timeout=API_TIMEOUT)
         except requests.RequestException as exc:
-            log.warning("Jellyfin GET %s failed: %s", path, exc)
+            log.warning("Jellyfin GET %s params=%s failed: %s", path, params, exc)
             return None
         if resp.status_code == 401:
             raise JellyfinAuthError(f"Jellyfin rejected the stored token on {path}")
@@ -101,6 +102,13 @@ class JellyfinClient:
 
     # ------------------------------------------------------------ library reads
 
+    # This proxy is a music server. A recursive /Items with no type filter and
+    # no container to scope to enumerates the user's whole Jellyfin library -
+    # movies and TV included - which on a large library is slow enough to hit
+    # API_TIMEOUT (Jellify's home view sends exactly this). Keep such calls to
+    # music. An explicit filter, from the route or the client, is left alone.
+    _MUSIC_TYPES = "MusicAlbum,MusicArtist,Audio,MusicVideo"
+
     def get_items(self, args, user_id: str, parent_id: str | None = None,
                   include_types: str | None = None) -> list[dict]:
         params = self._forwarded(args, UserId=user_id)
@@ -110,6 +118,8 @@ class JellyfinClient:
         # whatever the client happened to send.
         if include_types:
             params["IncludeItemTypes"] = include_types
+        if not params.get("IncludeItemTypes") and not parent_id:
+            params["IncludeItemTypes"] = self._MUSIC_TYPES
         return self._items(self._get("/Items", params))
 
     def get_item(self, item_id: str, user_id: str) -> dict | None:

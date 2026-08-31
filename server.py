@@ -32,6 +32,8 @@ import uuid
 import requests
 from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request, Response, abort, redirect, stream_with_context
+from flask import Request as FlaskRequest
+from werkzeug.datastructures import ImmutableMultiDict
 import logging
 
 # Load ./.env before importing anything that reads os.environ at import time
@@ -56,6 +58,48 @@ from translate.tidal_jellyfin_translator import (
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s",)
 log = logging.getLogger("subsonic-proxy")
+
+
+class _CIMultiDict(ImmutableMultiDict):
+    """Query/form args looked up without regard to key case.
+
+    Real Jellyfin treats query parameters case-insensitively, and its generated
+    SDKs send the camelCase spelling from the OpenAPI spec (`searchTerm`,
+    `includeItemTypes`, `parentId`); hand-written clients tend to send
+    PascalCase. This proxy reads PascalCase throughout, so without this a
+    camelCase client (Jellify, Swiftfin) silently loses its search term and
+    type filter and every browse looks like a bare "list everything".
+    """
+
+    def __init__(self, mapping=None):
+        super().__init__(mapping)
+        self._canonical = {}
+        for key in super().keys():
+            self._canonical.setdefault(key.lower(), key)
+
+    def _key(self, key):
+        if isinstance(key, str):
+            return self._canonical.get(key.lower(), key)
+        return key
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._key(key))
+
+    def get(self, key, default=None, type=None):
+        return super().get(self._key(key), default, type)
+
+    def getlist(self, key, type=None):
+        return super().getlist(self._key(key), type)
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+
+class _CIRequest(FlaskRequest):
+    parameter_storage_class = _CIMultiDict
+
+
+app.request_class = _CIRequest
 
 # Tokens ride in the query string (see MediaSource.hls_for), and both werkzeug
 # and gunicorn log the whole request line - so scrub them before anything is
